@@ -1,0 +1,27 @@
+{
+  "servers": [
+    {
+      "name": "searxng",
+      "type": "http",
+      "url": "http://host.docker.internal:28765/mcp",
+      "descriptionPrefix": "Search current public web information through the SearxNG MCP server. Use this for internet/news/docs lookups, not for saved memory."
+    },
+    {
+      "name": "engram",
+      "type": "direct",
+      "cmd": ["/usr/local/bin/engram", "mcp"],
+      "enabled": true,
+      "descriptionPrefix": "Persistent operational memory from Engram. Use these mem_* tools for recalled decisions, session context, preferences, and saved learnings."
+    },
+    {
+      "name": "youtube",
+      "type": "stdio",
+      "container": "analizetube-mcp",
+      "cmd": ["node", "dist/server.js"],
+      "enabled": true,
+      "timeoutMs": 900000,
+      "prefix": "youtube",
+      "descriptionPrefix": "YouTube analysis tools. Use these only for YouTube URLs, transcripts, and video metadata."
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+services:
+  mcp-gateway:
+    build: .
+    image: mcp-gateway:latest
+    container_name: mcp-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./servers.json:/app/servers.json:ro
+    environment:
+      PORT: 23001
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:23001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

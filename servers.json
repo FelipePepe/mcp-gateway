@@ -1,0 +1,55 @@
+{
+  "servers": [
+    {
+      "name": "searxng",
+      "type": "http",
+      "url": "http://host.docker.internal:28765/mcp",
+      "descriptionPrefix": "Search current public web information through the SearxNG MCP server. Use this for internet/news/docs lookups, not for saved memory."
+    },
+    {
+      "name": "engram",
+      "type": "direct",
+      "cmd": [
+        "/usr/local/bin/engram",
+        "mcp"
+      ],
+      "enabled": true,
+      "descriptionPrefix": "Persistent operational memory from Engram. Use these mem_* tools for recalled decisions, session context, preferences, and saved learnings."
+    },
+    {
+      "name": "youtube",
+      "type": "stdio",
+      "container": "analizetube-mcp",
+      "cmd": [
+        "node",
+        "dist/server.js"
+      ],
+      "enabled": true,
+      "timeoutMs": 900000,
+      "prefix": "youtube",
+      "descriptionPrefix": "YouTube analysis tools. Use these only for YouTube URLs, transcripts, and video metadata."
+    },
+    {
+      "name": "atlas",
+      "type": "stdio",
+      "container": "atlas-mcp",
+      "cmd": [
+        "node",
+        "dist/server.js"
+      ],
+      "enabled": true,
+      "descriptionPrefix": "Atlas knowledge-base tools backed by the Obsidian vault. Use these for persistent notes, project documentation, setup docs, and wikilink relationships stored in Atlas."
+    },
+    {
+      "name": "sonarqube",
+      "type": "direct",
+      "cmd": [
+        "/app/sonarqube-wrapper.cjs"
+      ],
+      "enabled": true,
+      "timeoutMs": 30000,
+      "descriptionPrefix": "SonarQube MCP. Use for quality gates, bugs, vulnerabilities, security hotspots, code smells, coverage and duplications. Connects to the local SonarQube instance.",
+      "prefix": "sonarqube"
+    }
+  ]
+}

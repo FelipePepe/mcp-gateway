@@ -1,0 +1,11 @@
+pre-commit:
+  commands:
+    branch-protection:
+      run: |
+        BRANCH=$(git branch --show-current 2>/dev/null)
+        if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ] || [ "$BRANCH" = "develop" ]; then
+          echo "❌ No se permiten commits directos en '$BRANCH'."
+          exit 1
+        fi
+    gitleaks:
+      run: gitleaks protect --staged --redact --config .gitleaks.toml
