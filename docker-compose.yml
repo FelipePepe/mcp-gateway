@@ -1,11 +1,11 @@
 services:
   mcp-gateway:
     build:
-      context: /mnt/nas/sources
+      context: ..
       dockerfile: mcp-gateway/Dockerfile
     image: mcp-gateway:latest
     container_name: mcp-gateway
-    restart: unless-stopped
+    restart: always
     ports:
       - "20001:20001"
     extra_hosts:
@@ -17,6 +17,8 @@ services:
       - /home/felipe/.engram:/root/.engram
       - ./sonarqube-wrapper.cjs:/app/sonarqube-wrapper.cjs:ro
       - ./sonarqube-bootstrap.env:/app/sonarqube-bootstrap.env:ro
+      - /home/felipe/.local/bin/codebase-memory-mcp:/usr/local/bin/codebase-memory-mcp:ro
+      - /mnt/nas/sources:/mnt/nas/sources
     environment:
       PORT: 20001
     healthcheck:

@@ -11,6 +11,24 @@ interface ToolEntry {
   originalName: string;
 }
 
+export interface ServerStatus {
+  name: string;
+  type: ServerConfig['type'];
+  target: string;
+  enabled: boolean;
+  connected: boolean;
+  tools: number;
+  error?: string;
+  lastConnectedAt?: string;
+}
+
+export interface CatalogTool {
+  name: string;
+  serverName: string;
+  originalName: string;
+  description?: string;
+}
+
 function resolveToolName(server: ServerConfig, originalName: string): string {
   const renamed = server.rename?.[originalName];
   if (renamed && renamed.trim()) {
@@ -32,32 +50,54 @@ export class Gateway {
   private clients = new Map<string, Client>();
   private toolMap = new Map<string, ToolEntry>();
   private timeouts = new Map<string, number>();
+  private statuses = new Map<string, ServerStatus>();
 
   async connect(servers: ServerConfig[]): Promise<void> {
+    this.clients.clear();
+    this.toolMap.clear();
+    this.timeouts.clear();
+    this.statuses.clear();
+
+    for (const server of servers) {
+      this.statuses.set(server.name, {
+        name: server.name,
+        type: server.type,
+        target: describeTarget(server),
+        enabled: server.enabled !== false,
+        connected: false,
+        tools: 0,
+      });
+    }
+
     const enabled = servers.filter((s) => s.enabled !== false);
     await Promise.allSettled(enabled.map((s) => this.connectServer(s)));
   }
 
   private async connectServer(server: ServerConfig): Promise<void> {
+    const timeoutMs = server.connectTimeoutMs ?? 10_000;
     const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('connect timeout after 10s')), 10_000),
+      setTimeout(() => reject(new Error(`connect timeout after ${timeoutMs}ms`)), timeoutMs),
     );
-    return Promise.race([this._connectServer(server), timeout]);
+    try {
+      return await Promise.race([this._connectServer(server), timeout]);
+    } catch (error) {
+      const message = (error as Error).message;
+      this.statuses.set(server.name, {
+        name: server.name,
+        type: server.type,
+        target: describeTarget(server),
+        enabled: true,
+        connected: false,
+        tools: 0,
+        error: message,
+      });
+      console.error(`[gateway] ${server.name} — failed to connect: ${message}`);
+    }
   }
 
   private async _connectServer(server: ServerConfig): Promise<void> {
     try {
-      const transport =
-        server.type === 'http'
-          ? new StreamableHTTPClientTransport(new URL(server.url!))
-          : server.type === 'sse'
-            ? new SSEClientTransport(new URL(server.url!))
-            : server.type === 'direct'
-              ? new StdioClientTransport({ command: server.cmd![0], args: server.cmd!.slice(1) })
-              : new StdioClientTransport({
-                  command: 'docker',
-                  args: ['exec', '-i', server.container!, ...server.cmd!],
-                });
+      const transport = buildTransport(server);
 
       const client = new Client({ name: 'mcp-gateway', version: '0.1.0' }, { capabilities: {} });
 
@@ -69,6 +109,9 @@ export class Gateway {
 
       for (const tool of tools) {
         const toolName = resolveToolName(server, tool.name);
+        if (this.toolMap.has(toolName)) {
+          console.error(`[gateway] ${server.name} — tool name collision: ${toolName}`);
+        }
         this.toolMap.set(toolName, {
           tool: {
             ...tool,
@@ -80,9 +123,28 @@ export class Gateway {
         });
       }
 
+      this.statuses.set(server.name, {
+        name: server.name,
+        type: server.type,
+        target: describeTarget(server),
+        enabled: true,
+        connected: true,
+        tools: tools.length,
+        lastConnectedAt: new Date().toISOString(),
+      });
       console.error(`[gateway] ${server.name} — ${tools.length} tool(s) registered`);
     } catch (error) {
-      console.error(`[gateway] ${server.name} — failed to connect: ${(error as Error).message}`);
+      const message = (error as Error).message;
+      this.statuses.set(server.name, {
+        name: server.name,
+        type: server.type,
+        target: describeTarget(server),
+        enabled: true,
+        connected: false,
+        tools: 0,
+        error: message,
+      });
+      console.error(`[gateway] ${server.name} — failed to connect: ${message}`);
     }
   }
 
@@ -125,4 +187,50 @@ export class Gateway {
   get connectedServers(): string[] {
     return Array.from(this.clients.keys());
   }
+
+  get serverStatuses(): ServerStatus[] {
+    return Array.from(this.statuses.values());
+  }
+
+  get catalog(): CatalogTool[] {
+    return Array.from(this.toolMap.entries()).map(([name, entry]) => ({
+      name,
+      serverName: entry.serverName,
+      originalName: entry.originalName,
+      description: entry.tool.description,
+    }));
+  }
+}
+
+function buildTransport(server: ServerConfig) {
+  if (server.type === 'http') {
+    return new StreamableHTTPClientTransport(new URL(requireField(server.url, server, 'url')));
+  }
+
+  if (server.type === 'sse') {
+    return new SSEClientTransport(new URL(requireField(server.url, server, 'url')));
+  }
+
+  const cmd = requireField(server.cmd, server, 'cmd');
+  if (server.type === 'stdio' && server.container) {
+    return new StdioClientTransport({
+      command: 'docker',
+      args: ['exec', '-i', server.container, ...cmd],
+    });
+  }
+
+  return new StdioClientTransport({ command: cmd[0], args: cmd.slice(1) });
+}
+
+function requireField<T>(value: T | undefined, server: ServerConfig, field: string): T {
+  if (value === undefined) {
+    throw new Error(`Invalid config for ${server.name}: missing ${field}`);
+  }
+  return value;
+}
+
+function describeTarget(server: ServerConfig): string {
+  if (server.url) return server.url;
+  if (server.container) return `${server.container}:${server.cmd?.join(' ') ?? ''}`.trim();
+  return server.cmd?.join(' ') ?? 'unconfigured';
 }
