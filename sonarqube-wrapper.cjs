@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { execSync, spawn } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
 
 const env = {};
@@ -11,40 +11,13 @@ if (fs.existsSync(envFile)) {
   });
 }
 
-const SITE = (env.INFISICAL_SITE_URL || "http://infisical.casa").replace(/\/$/, "");
-const CLIENT_ID = env.INFISICAL_MACHINE_CLIENT_ID;
-const CLIENT_SECRET = env.INFISICAL_MACHINE_CLIENT_SECRET;
-const PROJECT_SLUG = env.SONARQUBE_INFISICAL_PROJECT_SLUG;
-const INFISICAL_ENV = env.SONARQUBE_INFISICAL_ENV || "dev";
-const SECRET_PATH = env.SONARQUBE_SECRET_PATH || "/";
+const SONARQUBE_URL = env.SONARQUBE_URL;
+const SONARQUBE_TOKEN = env.SONARQUBE_TOKEN;
 
-function doRequest(url, opts) {
-  opts = opts || {};
-  const headers = Object.entries(opts.headers || {}).map(
-    function(kv) { return "--header='" + kv[0] + ": " + kv[1] + "'"; }
-  ).join(" ");
-  const body = opts.body ? "--post-data='" + opts.body.replace(/'/g, "'\\''") + "'" : "";
-  const cmd = "wget -qO- " + headers + " " + body + " '" + url + "'";
-  return JSON.parse(execSync(cmd, { encoding: "utf8", timeout: 10000 }));
+if (!SONARQUBE_URL || !SONARQUBE_TOKEN) {
+  process.stderr.write("ERROR: SONARQUBE_URL or SONARQUBE_TOKEN not set in sonarqube-bootstrap.env\n");
+  process.exit(1);
 }
-
-const loginResp = doRequest(SITE + "/api/v1/auth/universal-auth/login", {
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET })
-});
-const accessToken = loginResp.accessToken;
-
-function fetchSecret(name) {
-  const qs = "workspaceSlug=" + PROJECT_SLUG + "&environment=" + INFISICAL_ENV +
-              "&secretPath=" + encodeURIComponent(SECRET_PATH) + "&type=shared&viewSecretValue=true";
-  const r = doRequest(SITE + "/api/v3/secrets/raw/" + name + "?" + qs, {
-    headers: { "Authorization": "Bearer " + accessToken }
-  });
-  return r.secret.secretValue;
-}
-
-const SONARQUBE_URL = fetchSecret("SONARQUBE_URL");
-const SONARQUBE_TOKEN = fetchSecret("SONARQUBE_TOKEN");
 
 const proc = spawn("docker", [
   "run", "-i", "--rm", "--network", "host",

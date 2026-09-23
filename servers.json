@@ -4,17 +4,28 @@
       "name": "searxng",
       "type": "http",
       "url": "http://host.docker.internal:28765/mcp",
+      "enabled": true,
+      "prefix": "searxng",
       "descriptionPrefix": "Search current public web information through the SearxNG MCP server. Use this for internet/news/docs lookups, not for saved memory."
     },
     {
+      "name": "webtools",
+      "type": "http",
+      "url": "http://host.docker.internal:28766/mcp",
+      "enabled": true,
+      "prefix": "webtools",
+      "descriptionPrefix": "Web page fetching tools. Use webtools_web_fetch to extract readable article text from a public URL (local, no account needed)."
+    },
+    {
       "name": "engram",
-      "type": "direct",
+      "type": "stdio",
       "cmd": [
         "/usr/local/bin/engram",
         "mcp"
       ],
       "enabled": true,
-      "descriptionPrefix": "Persistent operational memory from Engram. Use these mem_* tools for recalled decisions, session context, preferences, and saved learnings."
+      "prefix": "engram",
+      "descriptionPrefix": "Persistent operational memory from Engram. Use these engram_mem_* tools for recalled decisions, session context, preferences, and saved learnings."
     },
     {
       "name": "youtube",
@@ -41,12 +52,24 @@
       "descriptionPrefix": "Atlas knowledge-base tools backed by the Obsidian vault. Use these for persistent notes, project documentation, setup docs, and wikilink relationships stored in Atlas."
     },
     {
+      "name": "codebase-memory",
+      "type": "stdio",
+      "cmd": [
+        "/usr/local/bin/codebase-memory-mcp"
+      ],
+      "enabled": true,
+      "timeoutMs": 60000,
+      "connectTimeoutMs": 30000,
+      "prefix": "cbm",
+      "descriptionPrefix": "Codebase knowledge graph (structure, calls, types) across indexed repos under /mnt/nas/sources. Use for structural code queries, not text search."
+    },
+    {
       "name": "sonarqube",
-      "type": "direct",
+      "type": "stdio",
       "cmd": [
         "/app/sonarqube-wrapper.cjs"
       ],
-      "enabled": true,
+      "enabled": false,
       "timeoutMs": 30000,
       "descriptionPrefix": "SonarQube MCP. Use for quality gates, bugs, vulnerabilities, security hotspots, code smells, coverage and duplications. Connects to the local SonarQube instance.",
       "prefix": "sonarqube"
