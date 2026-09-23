@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir "mcp<2" httpx trafilatura
+
+COPY server.py .
+
+EXPOSE 28766
+
+CMD ["python", "server.py"]
