@@ -89,10 +89,21 @@ async function main() {
   });
 
   app.get('/health', (_req, res) => {
+    const servers = gateway.serverStatuses;
+    const failedServers = servers.filter((server) => server.enabled && !server.connected);
+
     res.json({
-      status: 'ok',
+      status: failedServers.length === 0 ? 'ok' : 'degraded',
       servers: gateway.connectedServers,
+      serverStatus: servers,
       tools: gateway.listTools().length,
+    });
+  });
+
+  app.get('/catalog', (_req, res) => {
+    res.json({
+      servers: gateway.serverStatuses,
+      tools: gateway.catalog,
     });
   });
 

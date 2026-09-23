@@ -9,6 +9,14 @@
       "descriptionPrefix": "Search current public web information through the SearxNG MCP server. Use this for internet/news/docs lookups, not for saved memory."
     },
     {
+      "name": "webtools",
+      "type": "http",
+      "url": "http://host.docker.internal:28766/mcp",
+      "enabled": true,
+      "prefix": "webtools",
+      "descriptionPrefix": "Web page fetching tools. Use webtools_web_fetch to extract readable article text from a public URL (local, no account needed)."
+    },
+    {
       "name": "engram",
       "type": "stdio",
       "cmd": [
