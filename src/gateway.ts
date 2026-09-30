@@ -29,6 +29,55 @@ export interface CatalogTool {
   description?: string;
 }
 
+export interface RetryOptions {
+  baseMs?: number;
+  capMs?: number;
+}
+
+export const RETRY_BASE_MS = 2_000;
+export const RETRY_CAP_MS = 30_000;
+
+type SleepFn = (ms: number) => Promise<void>;
+
+const defaultSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Run `attempt` until it returns true, retrying forever with
+ * exponential backoff (base->cap). "Late upstream" is not a permanent
+ * failure: the cost of a dead upstream is ~1 attempt/30s per server.
+ * Returns true on success, false only if `shouldStop()` became true.
+ */
+export async function connectWithRetry(
+  name: string,
+  attempt: () => Promise<boolean>,
+  opts: {
+    baseMs?: number;
+    capMs?: number;
+    sleepMs?: SleepFn;
+    shouldStop?: () => boolean;
+  } = {},
+): Promise<boolean> {
+  const baseMs = opts.baseMs ?? RETRY_BASE_MS;
+  const capMs = opts.capMs ?? RETRY_CAP_MS;
+  const sleepMs = opts.sleepMs ?? defaultSleep;
+  const shouldStop = opts.shouldStop ?? (() => false);
+
+  let n = 0;
+  for (;;) {
+    if (shouldStop()) return false;
+    n++;
+    try {
+      if (await attempt()) return true;
+    } catch {
+      // attempt reported an error: fall through to backoff
+    }
+    if (shouldStop()) return false;
+    const delayMs = Math.min(baseMs * 2 ** (n - 1), capMs);
+    console.error(`[gateway] ${name} — reconnect attempt ${n} failed; retrying in ${delayMs}ms`);
+    await sleepMs(delayMs);
+  }
+}
+
 function resolveToolName(server: ServerConfig, originalName: string): string {
   const renamed = server.rename?.[originalName];
   if (renamed && renamed.trim()) {
@@ -51,8 +100,14 @@ export class Gateway {
   private toolMap = new Map<string, ToolEntry>();
   private timeouts = new Map<string, number>();
   private statuses = new Map<string, ServerStatus>();
+  private stopped = false;
 
-  async connect(servers: ServerConfig[]): Promise<void> {
+  /** Halt all background reconnect loops (idempotent). */
+  stop(): void {
+    this.stopped = true;
+  }
+
+  async connect(servers: ServerConfig[], retry?: RetryOptions): Promise<void> {
     this.clients.clear();
     this.toolMap.clear();
     this.timeouts.clear();
@@ -71,6 +126,23 @@ export class Gateway {
 
     const enabled = servers.filter((s) => s.enabled !== false);
     await Promise.allSettled(enabled.map((s) => this.connectServer(s)));
+
+    // Upstreams that were not up at boot (docker-compose start-order races)
+    // keep retrying in the background until they answer. connect() must not
+    // block on them: the HTTP endpoint keeps serving whatever is available.
+    for (const server of enabled) {
+      if (this.statuses.get(server.name)?.connected) continue;
+      void connectWithRetry(server.name, async () => {
+        await this.connectServer(server);
+        return this.clients.has(server.name);
+      }, {
+        baseMs: retry?.baseMs,
+        capMs: retry?.capMs,
+        shouldStop: () => this.stopped,
+      }).then((ok) => {
+        if (ok) console.error(`[gateway] ${server.name} — reconnected, tools registered`);
+      });
+    }
   }
 
   private async connectServer(server: ServerConfig): Promise<void> {
