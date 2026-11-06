@@ -2,8 +2,15 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ServerConfig } from './config.js';
+
+/** One connect attempt; `cancelled` is set when it times out. */
+interface Attempt {
+  cancelled: boolean;
+  client?: Client;
+}
 
 interface ToolEntry {
   tool: Tool;
@@ -101,6 +108,13 @@ export class Gateway {
   private timeouts = new Map<string, number>();
   private statuses = new Map<string, ServerStatus>();
   private stopped = false;
+  private retryOptions: RetryOptions = {};
+  /** Servers with a reconnect loop in flight (dedupes boot and onclose paths). */
+  private reconnecting = new Set<string>();
+
+  constructor(
+    private readonly transportFactory: (server: ServerConfig) => Transport = buildTransport,
+  ) {}
 
   /** Halt all background reconnect loops (idempotent). */
   stop(): void {
@@ -112,6 +126,7 @@ export class Gateway {
     this.toolMap.clear();
     this.timeouts.clear();
     this.statuses.clear();
+    this.retryOptions = retry ?? {};
 
     for (const server of servers) {
       this.statuses.set(server.name, {
@@ -132,26 +147,64 @@ export class Gateway {
     // block on them: the HTTP endpoint keeps serving whatever is available.
     for (const server of enabled) {
       if (this.statuses.get(server.name)?.connected) continue;
-      void connectWithRetry(server.name, async () => {
-        await this.connectServer(server);
-        return this.clients.has(server.name);
-      }, {
-        baseMs: retry?.baseMs,
-        capMs: retry?.capMs,
-        shouldStop: () => this.stopped,
-      }).then((ok) => {
-        if (ok) console.error(`[gateway] ${server.name} — reconnected, tools registered`);
-      });
+      this.scheduleReconnect(server);
     }
   }
 
-  private async connectServer(server: ServerConfig): Promise<void> {
+  /** Retry an upstream in the background until it answers (one loop per server). */
+  private scheduleReconnect(server: ServerConfig): void {
+    if (this.stopped || this.reconnecting.has(server.name)) return;
+    this.reconnecting.add(server.name);
+    void connectWithRetry(server.name, () => this.connectServer(server), {
+      baseMs: this.retryOptions.baseMs,
+      capMs: this.retryOptions.capMs,
+      shouldStop: () => this.stopped,
+    })
+      .then((ok) => {
+        if (ok) console.error(`[gateway] ${server.name} — reconnected, tools registered`);
+      })
+      .finally(() => this.reconnecting.delete(server.name));
+  }
+
+  private dropTools(serverName: string): void {
+    for (const [toolName, entry] of this.toolMap) {
+      if (entry.serverName === serverName) this.toolMap.delete(toolName);
+    }
+  }
+
+  private handleDisconnect(server: ServerConfig, client: Client): void {
+    // Ignore closes from clients that were already replaced or released.
+    if (this.clients.get(server.name) !== client) return;
+    this.clients.delete(server.name);
+    this.dropTools(server.name);
+    this.statuses.set(server.name, {
+      name: server.name,
+      type: server.type,
+      target: describeTarget(server),
+      enabled: true,
+      connected: false,
+      tools: 0,
+      error: 'upstream closed',
+    });
+    console.error(`[gateway] ${server.name} — upstream closed; reconnecting`);
+    this.scheduleReconnect(server);
+  }
+
+  private async connectServer(server: ServerConfig): Promise<boolean> {
     const timeoutMs = server.connectTimeoutMs ?? 10_000;
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`connect timeout after ${timeoutMs}ms`)), timeoutMs),
-    );
+    const attempt: Attempt = { cancelled: false };
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Cancel the in-flight attempt so a late success cannot register
+        // itself, and release its client/transport.
+        attempt.cancelled = true;
+        void attempt.client?.close().catch(() => undefined);
+        reject(new Error(`connect timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
     try {
-      return await Promise.race([this._connectServer(server), timeout]);
+      return await Promise.race([this._connectServer(server, attempt), timeout]);
     } catch (error) {
       const message = (error as Error).message;
       this.statuses.set(server.name, {
@@ -164,20 +217,35 @@ export class Gateway {
         error: message,
       });
       console.error(`[gateway] ${server.name} — failed to connect: ${message}`);
+      return false;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
-  private async _connectServer(server: ServerConfig): Promise<void> {
+  private async _connectServer(server: ServerConfig, attempt: Attempt): Promise<boolean> {
+    let client: Client | undefined;
     try {
-      const transport = buildTransport(server);
+      const transport = this.transportFactory(server);
 
-      const client = new Client({ name: 'mcp-gateway', version: '0.1.0' }, { capabilities: {} });
+      client = new Client({ name: 'mcp-gateway', version: '0.1.0' }, { capabilities: {} });
+      attempt.client = client;
 
+      // Register the client only once connect AND listTools both succeeded,
+      // so a half-connected upstream is never reported as up.
       await client.connect(transport);
-      this.clients.set(server.name, client);
-      if (server.timeoutMs) this.timeouts.set(server.name, server.timeoutMs);
-
       const { tools } = await client.listTools();
+
+      if (attempt.cancelled) {
+        // Timed out while in flight (the timer already closed the client).
+        return false;
+      }
+
+      this.dropTools(server.name);
+      this.clients.set(server.name, client);
+      const live = client;
+      live.onclose = () => this.handleDisconnect(server, live);
+      if (server.timeoutMs) this.timeouts.set(server.name, server.timeoutMs);
 
       for (const tool of tools) {
         const toolName = resolveToolName(server, tool.name);
@@ -205,7 +273,10 @@ export class Gateway {
         lastConnectedAt: new Date().toISOString(),
       });
       console.error(`[gateway] ${server.name} — ${tools.length} tool(s) registered`);
+      return true;
     } catch (error) {
+      if (attempt.cancelled) return false; // timeout path already closed it and reported
+      await client?.close().catch(() => undefined);
       const message = (error as Error).message;
       this.statuses.set(server.name, {
         name: server.name,
@@ -217,6 +288,7 @@ export class Gateway {
         error: message,
       });
       console.error(`[gateway] ${server.name} — failed to connect: ${message}`);
+      return false;
     }
   }
 
