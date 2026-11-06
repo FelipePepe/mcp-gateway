@@ -53,5 +53,8 @@ Strategy `ask-on-risk`, forecast well under ~400 authored lines: single slice. N
 - Route: delegated direct (one writer), trigger: writer trigger (2 non-trivial files).
 - Known test gaps: InMemoryTransport re-enters `close()` via its peer, so a double `client.close()` is not detectable; no assertion on the server side after a cancelled late success.
 
+- Commit: `e990df2` fix(gateway): recover upstreams that close, fail listTools or time out (+297/-19, 3 files).
+- RDD assessment: unavailable (`gentle-ai` not on PATH); treated as due, review not run. Pending the user's decision.
+
 ## Next step
-Commit work unit on `fix/gateway-upstream-lifecycle`, run RDD assessment, then wait for the user (no push/PR).
+Wait for the user: review decision, push / PR into `feature/gateway-connect-retry`, and redeploy (not done).
