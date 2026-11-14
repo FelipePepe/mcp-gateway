@@ -7,6 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createApp, type GatewayApp } from './app.js';
 import { Gateway } from './gateway.js';
 import type { ServerConfig } from './config.js';
@@ -29,9 +30,16 @@ const INITIALIZE = {
 };
 const LIST_TOOLS = { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} };
 
-/** In-memory upstream factory: every call is one connect attempt. */
-function makeFactory(tools: string[]): (server: ServerConfig) => Transport {
+/**
+ * In-memory upstream factory: every call is one connect attempt. While
+ * `isUp()` is false the upstream is unreachable and the attempt fails.
+ */
+function makeFactory(
+  tools: string[],
+  isUp: () => boolean = () => true,
+): (server: ServerConfig) => Transport {
   return () => {
+    if (!isUp()) throw new Error('upstream down');
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     const server = new McpServer({ name: 'fake', version: '0.0.0' });
     for (const name of tools) {
@@ -54,8 +62,11 @@ interface Harness {
 
 let harness: Harness | undefined;
 
-async function start(tools: string[] = ['a', 'b']): Promise<Harness> {
-  const gateway = new Gateway(makeFactory(tools));
+async function start(
+  tools: string[] = ['a', 'b'],
+  isUp: () => boolean = () => true,
+): Promise<Harness> {
+  const gateway = new Gateway(makeFactory(tools, isUp));
   await gateway.connect([fake], FAST);
   const gatewayApp = createApp(gateway);
   const httpServer = await new Promise<HttpServer>((resolve) => {
@@ -230,6 +241,69 @@ describe('createApp /mcp', () => {
     });
     expect(result.isError).toBeFalsy();
     expect(result.content).toEqual([{ type: 'text', text: 'ok:a' }]);
+  });
+});
+
+describe('createApp tool list change notifications', () => {
+  it('advertises tools.listChanged', async () => {
+    const h = await start();
+    const client = await connectClient(h);
+    expect(client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+  });
+
+  it('notifies a connected client when an upstream that was down comes up', async () => {
+    let upstreamUp = false;
+    const h = await start(['a', 'b'], () => upstreamUp);
+
+    // Server-initiated notifications travel over the standalone GET SSE
+    // stream, which the SDK client opens in the background after initialize:
+    // watch its fetch to know when that stream is established.
+    let sseOpened!: () => void;
+    const sseOpen = new Promise<void>((resolve) => {
+      sseOpened = resolve;
+    });
+    const watchingFetch: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      if (init?.method === 'GET' && res.ok) sseOpened();
+      return res;
+    };
+
+    const client = new Client({ name: 'test-client', version: '0.0.0' }, { capabilities: {} });
+    let notified!: () => void;
+    const notification = new Promise<void>((resolve) => {
+      notified = resolve;
+    });
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => notified());
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`${h.url}/mcp`), { fetch: watchingFetch }),
+    );
+    h.clients.push(client);
+
+    await sseOpen;
+    expect((await client.listTools()).tools).toEqual([]);
+
+    upstreamUp = true;
+    await notification;
+
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual(['a', 'b']);
+  });
+
+  it('unsubscribes from the gateway on closeSessions()', async () => {
+    const unsubscribe = vi.fn();
+    const subscribe = Gateway.prototype.onToolsChanged;
+    vi.spyOn(Gateway.prototype, 'onToolsChanged').mockImplementation(function (
+      this: Gateway,
+      listener: () => void,
+    ) {
+      return unsubscribe.mockImplementation(subscribe.call(this, listener));
+    });
+
+    const h = await start();
+    expect(unsubscribe).not.toHaveBeenCalled();
+
+    await h.gatewayApp.closeSessions();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 });
 

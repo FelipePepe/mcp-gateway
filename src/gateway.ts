@@ -111,10 +111,33 @@ export class Gateway {
   private retryOptions: RetryOptions = {};
   /** Servers with a reconnect loop in flight (dedupes boot and onclose paths). */
   private reconnecting = new Set<string>();
+  private toolsChangedListeners = new Set<() => void>();
 
   constructor(
     private readonly transportFactory: (server: ServerConfig) => Transport = buildTransport,
   ) {}
+
+  /**
+   * Subscribe to changes of the published tool list (an upstream registered
+   * or dropped tools). Returns the unsubscribe function.
+   */
+  onToolsChanged(listener: () => void): () => void {
+    this.toolsChangedListeners.add(listener);
+    return () => {
+      this.toolsChangedListeners.delete(listener);
+    };
+  }
+
+  private notifyToolsChanged(): void {
+    for (const listener of Array.from(this.toolsChangedListeners)) {
+      try {
+        listener();
+      } catch (error) {
+        // A broken listener must never break upstream bookkeeping.
+        console.error(`[gateway] tools changed listener failed: ${(error as Error).message}`);
+      }
+    }
+  }
 
   /** Halt all background reconnect loops (idempotent). */
   stop(): void {
@@ -166,17 +189,22 @@ export class Gateway {
       .finally(() => this.reconnecting.delete(server.name));
   }
 
-  private dropTools(serverName: string): void {
+  /** Remove every tool of `serverName`; returns whether any was removed. */
+  private dropTools(serverName: string): boolean {
+    let dropped = false;
     for (const [toolName, entry] of this.toolMap) {
-      if (entry.serverName === serverName) this.toolMap.delete(toolName);
+      if (entry.serverName !== serverName) continue;
+      this.toolMap.delete(toolName);
+      dropped = true;
     }
+    return dropped;
   }
 
   private handleDisconnect(server: ServerConfig, client: Client): void {
     // Ignore closes from clients that were already replaced or released.
     if (this.clients.get(server.name) !== client) return;
     this.clients.delete(server.name);
-    this.dropTools(server.name);
+    const dropped = this.dropTools(server.name);
     this.statuses.set(server.name, {
       name: server.name,
       type: server.type,
@@ -187,6 +215,7 @@ export class Gateway {
       error: 'upstream closed',
     });
     console.error(`[gateway] ${server.name} — upstream closed; reconnecting`);
+    if (dropped) this.notifyToolsChanged();
     this.scheduleReconnect(server);
   }
 
@@ -241,7 +270,7 @@ export class Gateway {
         return false;
       }
 
-      this.dropTools(server.name);
+      const dropped = this.dropTools(server.name);
       this.clients.set(server.name, client);
       const live = client;
       live.onclose = () => this.handleDisconnect(server, live);
@@ -273,6 +302,7 @@ export class Gateway {
         lastConnectedAt: new Date().toISOString(),
       });
       console.error(`[gateway] ${server.name} — ${tools.length} tool(s) registered`);
+      if (dropped || tools.length > 0) this.notifyToolsChanged();
       return true;
     } catch (error) {
       if (attempt.cancelled) return false; // timeout path already closed it and reported

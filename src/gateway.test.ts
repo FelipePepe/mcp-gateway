@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { connectWithRetry, Gateway, type RetryOptions } from './gateway.js';
@@ -246,5 +248,73 @@ describe('Gateway upstream lifecycle', () => {
     await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(false));
     await new Promise((r) => setTimeout(r, 100));
     expect(up.transports.length).toBe(1);
+  });
+});
+
+describe('Gateway tool list change notifications', () => {
+  it('notifies on register, on upstream close and again on reconnect, until unsubscribed', async () => {
+    const up = makeUpstream(() => ({ tools: ['a', 'b'] }));
+    const gw = new Gateway(up.factory);
+    const listener = vi.fn();
+    const unsubscribe = gw.onToolsChanged(listener);
+
+    await gw.connect([fake], { baseMs: 40, capMs: 40 });
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    await up.servers[0].close();
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(false));
+    expect(listener).toHaveBeenCalledTimes(2);
+
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(true));
+    expect(listener).toHaveBeenCalledTimes(3);
+
+    unsubscribe();
+    gw.stop();
+    await up.servers[1].close();
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(false));
+    expect(gw.listTools()).toEqual([]);
+    expect(listener).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not notify when the tool list did not change', async () => {
+    // An upstream that publishes an empty tool list (McpServer only answers
+    // tools/list once a tool is registered, so use the low-level Server).
+    const upstream = new Server(
+      { name: 'empty', version: '0.0.0' },
+      { capabilities: { tools: {} } },
+    );
+    upstream.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    const gw = new Gateway(() => {
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      void upstream.connect(serverSide);
+      return clientSide;
+    });
+    const listener = vi.fn();
+    gw.onToolsChanged(listener);
+
+    await gw.connect([fake], FAST);
+    gw.stop();
+    expect(gw.serverStatuses[0]).toMatchObject({ connected: true, tools: 0 });
+
+    await upstream.close();
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(false));
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('survives a listener that throws and still notifies the others', async () => {
+    const up = makeUpstream(() => ({ tools: ['a'] }));
+    const gw = new Gateway(up.factory);
+    const healthy = vi.fn();
+    gw.onToolsChanged(() => {
+      throw new Error('listener exploded');
+    });
+    gw.onToolsChanged(healthy);
+
+    await gw.connect([fake], FAST);
+    gw.stop();
+
+    expect(gw.serverStatuses[0]).toMatchObject({ connected: true, tools: 1 });
+    expect(gw.listTools().map((t) => t.name)).toEqual(['a']);
+    expect(healthy).toHaveBeenCalledTimes(1);
   });
 });

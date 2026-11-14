@@ -54,11 +54,21 @@ function guarded(handler: (req: Request, res: Response) => Promise<void>): Reque
 export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
   const heartbeatIntervalMs = opts.heartbeatIntervalMs ?? PROGRESS_HEARTBEAT_INTERVAL_MS;
   const transports = new Map<string, StreamableHTTPServerTransport>();
+  /** MCP Server of each live session, to push server-initiated notifications. */
+  const servers = new Map<string, Server>();
+
+  // Tell every live session that the aggregated tool list changed. A session
+  // without an open SSE stream, or already closing, is simply skipped.
+  const unsubscribeToolsChanged = gateway.onToolsChanged(() => {
+    for (const server of servers.values()) {
+      server.sendToolListChanged().catch(() => undefined);
+    }
+  });
 
   function buildServer(): Server {
     const server = new Server(
       { name: 'mcp-gateway', version: '0.1.0' },
-      { capabilities: { tools: {} } }
+      { capabilities: { tools: { listChanged: true } } }
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -114,19 +124,24 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
       return;
     }
 
+    const server = buildServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
         transports.set(id, transport);
+        servers.set(id, server);
       },
     });
     // Set before connect(): the Server chains this handler with its own
     // close handling, so a closed transport also releases its Server.
     transport.onclose = () => {
       const id = transport.sessionId;
-      if (id !== undefined && transports.get(id) === transport) transports.delete(id);
+      if (id !== undefined && transports.get(id) === transport) {
+        transports.delete(id);
+        servers.delete(id);
+      }
     };
-    await buildServer().connect(transport);
+    await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   }));
 
@@ -167,9 +182,11 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
   return {
     app,
     closeSessions: async () => {
+      unsubscribeToolsChanged();
       const live = Array.from(transports.values());
       await Promise.all(live.map((transport) => transport.close().catch(() => undefined)));
       transports.clear();
+      servers.clear();
     },
     sessionCount: () => transports.size,
   };
