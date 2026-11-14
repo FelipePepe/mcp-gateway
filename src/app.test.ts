@@ -1,4 +1,4 @@
-import type { Server as HttpServer } from 'http';
+import { createServer, request as httpRequest, type Server as HttpServer } from 'http';
 import type { AddressInfo } from 'net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -8,7 +8,13 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createApp, type AppOptions, type GatewayApp } from './app.js';
+import {
+  createApp,
+  parseAllowedHosts,
+  parseAuthToken,
+  type AppOptions,
+  type GatewayApp,
+} from './app.js';
 import { Gateway } from './gateway.js';
 import type { ServerConfig } from './config.js';
 
@@ -65,7 +71,8 @@ let harness: Harness | undefined;
 interface StartOptions {
   /** Upstream transport factory; defaults to `makeFactory(tools, isUp)`. */
   factory?: (server: ServerConfig) => Transport;
-  appOptions?: AppOptions;
+  /** App options; a function receives the port the harness listens on. */
+  appOptions?: AppOptions | ((port: number) => AppOptions);
 }
 
 async function start(
@@ -75,18 +82,26 @@ async function start(
 ): Promise<Harness> {
   const gateway = new Gateway(options.factory ?? makeFactory(tools, isUp));
   await gateway.connect([fake], FAST);
-  const gatewayApp = createApp(gateway, options.appOptions);
-  const httpServer = await new Promise<HttpServer>((resolve) => {
-    const s = gatewayApp.app.listen(0, '127.0.0.1', () => resolve(s));
-  });
+  // Listen first so options that depend on the port (allowedHosts) can be built.
+  const httpServer = createServer();
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
   const { port } = httpServer.address() as AddressInfo;
+  const appOptions =
+    typeof options.appOptions === 'function' ? options.appOptions(port) : options.appOptions;
+  const gatewayApp = createApp(gateway, appOptions);
+  httpServer.on('request', gatewayApp.app);
   harness = { gateway, gatewayApp, httpServer, url: `http://127.0.0.1:${port}`, clients: [] };
   return harness;
 }
 
-async function connectClient(h: Harness): Promise<Client> {
+async function connectClient(h: Harness, headers?: Record<string, string>): Promise<Client> {
   const client = new Client({ name: 'test-client', version: '0.0.0' }, { capabilities: {} });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`${h.url}/mcp`)));
+  await client.connect(
+    new StreamableHTTPClientTransport(
+      new URL(`${h.url}/mcp`),
+      headers ? { requestInit: { headers } } : undefined,
+    ),
+  );
   h.clients.push(client);
   return client;
 }
@@ -97,6 +112,44 @@ function post(h: Harness, body: unknown, sessionId?: string): Promise<Response> 
     method: 'POST',
     headers: sessionId ? { ...MCP_HEADERS, 'mcp-session-id': sessionId } : MCP_HEADERS,
     body: JSON.stringify(body),
+  });
+}
+
+interface RawResponse {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  json: unknown;
+}
+
+/**
+ * Request with node:http instead of fetch, which does not let a caller choose
+ * the Host header.
+ */
+function rawRequest(
+  h: Harness,
+  options: { method: string; path: string; headers?: Record<string, string>; body?: unknown },
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      `${h.url}${options.path}`,
+      { method: options.method, headers: { ...MCP_HEADERS, ...options.headers }, agent: false },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf-8');
+          let json: unknown;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = text;
+          }
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, json });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end(options.body === undefined ? undefined : JSON.stringify(options.body));
   });
 }
 
@@ -376,5 +429,293 @@ describe('createApp /health and /catalog', () => {
     const catalog = await (await fetch(`${h.url}/catalog`)).json();
     expect(catalog.servers[0]).toMatchObject({ name: 'fake', connected: true });
     expect(catalog.tools.map((t: { name: string }) => t.name).sort()).toEqual(['a', 'b']);
+  });
+});
+
+const TOKEN = 'correct-horse-battery-staple';
+const UNAUTHORIZED = {
+  jsonrpc: '2.0',
+  error: { code: -32001, message: 'Unauthorized' },
+  id: null,
+};
+
+describe('createApp bearer token (authToken)', () => {
+  const startWithAuth = () => start(['a', 'b'], () => true, { appOptions: { authToken: TOKEN } });
+  const BAD_CREDENTIALS: Array<[string, Record<string, string>]> = [
+    ['no Authorization header', {}],
+    ['a wrong token', { authorization: 'Bearer wrong-token' }],
+    ['a token that only shares a prefix', { authorization: `Bearer ${TOKEN}x` }],
+    ['another scheme', { authorization: `Basic ${TOKEN}` }],
+    ['an empty bearer token', { authorization: 'Bearer ' }],
+  ];
+
+  async function expectUnauthorized(res: Response): Promise<void> {
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe('Bearer');
+    expect(await res.json()).toEqual(UNAUTHORIZED);
+  }
+
+  it.each(BAD_CREDENTIALS)('answers 401 on every /mcp method with %s', async (_label, auth) => {
+    const h = await startWithAuth();
+    const headers = { ...MCP_HEADERS, ...auth };
+
+    await expectUnauthorized(
+      await fetch(`${h.url}/mcp`, { method: 'POST', headers, body: JSON.stringify(INITIALIZE) }),
+    );
+    await expectUnauthorized(await fetch(`${h.url}/mcp`, { method: 'GET', headers }));
+    await expectUnauthorized(await fetch(`${h.url}/mcp`, { method: 'DELETE', headers }));
+    expect(h.gatewayApp.sessionCount()).toBe(0);
+  });
+
+  it.each(BAD_CREDENTIALS)('answers 401 on /catalog with %s', async (_label, auth) => {
+    const h = await startWithAuth();
+    await expectUnauthorized(await fetch(`${h.url}/catalog`, { headers: auth }));
+  });
+
+  it('checks the token before the session lookup and before parsing the body', async () => {
+    const h = await startWithAuth();
+
+    // Unknown session ids answer 401, not 404: nothing leaks without a token.
+    for (const method of ['POST', 'GET', 'DELETE']) {
+      await expectUnauthorized(
+        await fetch(`${h.url}/mcp`, {
+          method,
+          headers: { ...MCP_HEADERS, 'mcp-session-id': 'does-not-exist' },
+          body: method === 'POST' ? JSON.stringify(LIST_TOOLS) : undefined,
+        }),
+      );
+    }
+
+    // A malformed body is not even parsed for an unauthenticated caller.
+    await expectUnauthorized(
+      await fetch(`${h.url}/mcp`, { method: 'POST', headers: MCP_HEADERS, body: '{not json' }),
+    );
+  });
+
+  it('serves the full round trip and /catalog with the right token', async () => {
+    const h = await startWithAuth();
+    const client = await connectClient(h, { authorization: `Bearer ${TOKEN}` });
+
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual(['a', 'b']);
+    const result = await client.callTool({ name: 'a', arguments: {} });
+    expect(result.content).toEqual([{ type: 'text', text: 'ok:a' }]);
+    expect(h.gatewayApp.sessionCount()).toBe(1);
+
+    // The scheme is case-insensitive (RFC 9110).
+    const catalog = await fetch(`${h.url}/catalog`, {
+      headers: { authorization: `bearer ${TOKEN}` },
+    });
+    expect(catalog.status).toBe(200);
+    expect(catalog.headers.get('www-authenticate')).toBeNull();
+    const body = await catalog.json();
+    expect(body.tools.map((t: { name: string }) => t.name).sort()).toEqual(['a', 'b']);
+  });
+
+  it('keeps /health open but reduces it for unauthenticated callers', async () => {
+    const h = await startWithAuth();
+
+    const anonymous = await fetch(`${h.url}/health`);
+    expect(anonymous.status).toBe(200);
+    // Exactly status and tools: no server names, targets or error strings.
+    expect(await anonymous.json()).toEqual({ status: 'ok', tools: 2 });
+
+    const wrong = await fetch(`${h.url}/health`, { headers: { authorization: 'Bearer nope' } });
+    expect(wrong.status).toBe(200);
+    expect(await wrong.json()).toEqual({ status: 'ok', tools: 2 });
+
+    const full = await (
+      await fetch(`${h.url}/health`, { headers: { authorization: `Bearer ${TOKEN}` } })
+    ).json();
+    expect(full).toMatchObject({ status: 'ok', servers: ['fake'], tools: 2 });
+    expect(full.serverStatus[0]).toMatchObject({ name: 'fake', connected: true, tools: 2 });
+  });
+});
+
+describe('createApp host allow-list (allowedHosts)', () => {
+  const startWithHosts = () =>
+    start(['a', 'b'], () => true, {
+      appOptions: (port) => ({ allowedHosts: [`127.0.0.1:${port}`, 'gateway.test'] }),
+    });
+
+  it('serves requests whose Host header is listed', async () => {
+    const h = await startWithHosts();
+    const client = await connectClient(h);
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual(['a', 'b']);
+
+    const other = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'gateway.test' },
+      body: INITIALIZE,
+    });
+    expect(other.status).toBe(200);
+  });
+
+  it('answers 403 on every /mcp method for a Host that is not listed', async () => {
+    const h = await startWithHosts();
+    const forbidden = {
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Invalid Host header: evil.example' },
+      id: null,
+    };
+
+    const init = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'evil.example' },
+      body: INITIALIZE,
+    });
+    expect(init.status).toBe(403);
+    expect(init.json).toEqual(forbidden);
+    expect(h.gatewayApp.sessionCount()).toBe(0);
+
+    // Requests that never reach a transport (unknown session) are covered too.
+    for (const method of ['POST', 'GET', 'DELETE']) {
+      const res = await rawRequest(h, {
+        method,
+        path: '/mcp',
+        headers: { host: 'evil.example', 'mcp-session-id': 'does-not-exist' },
+        body: method === 'POST' ? LIST_TOOLS : undefined,
+      });
+      expect(res.status).toBe(403);
+      expect(res.json).toEqual(forbidden);
+    }
+
+    // A live session cannot be driven through another Host either.
+    const sessionId = await rawInitialize(h);
+    const hijack = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'evil.example', 'mcp-session-id': sessionId },
+      body: LIST_TOOLS,
+    });
+    expect(hijack.status).toBe(403);
+  });
+
+  it('rejects the Host before asking for the token when both are enabled', async () => {
+    const h = await start(['a'], () => true, {
+      appOptions: (port) => ({ authToken: TOKEN, allowedHosts: [`127.0.0.1:${port}`] }),
+    });
+
+    const badHost = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'evil.example', authorization: `Bearer ${TOKEN}` },
+      body: INITIALIZE,
+    });
+    expect(badHost.status).toBe(403);
+
+    const noToken = await post(h, INITIALIZE);
+    expect(noToken.status).toBe(401);
+
+    const client = await connectClient(h, { authorization: `Bearer ${TOKEN}` });
+    expect((await client.listTools()).tools.map((t) => t.name)).toEqual(['a']);
+  });
+});
+
+describe('createApp without authToken and allowedHosts', () => {
+  it('behaves as before: no token needed, any Host accepted, full /health', async () => {
+    const h = await start();
+
+    // An Authorization header is simply ignored.
+    const client = await connectClient(h, { authorization: 'Bearer whatever' });
+    expect((await client.listTools()).tools.map((t) => t.name).sort()).toEqual(['a', 'b']);
+
+    const otherHost = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'anything.example' },
+      body: INITIALIZE,
+    });
+    expect(otherHost.status).toBe(200);
+
+    const unknown = await post(h, LIST_TOOLS, 'does-not-exist');
+    expect(unknown.status).toBe(404);
+    expect(unknown.headers.get('www-authenticate')).toBeNull();
+
+    const catalog = await fetch(`${h.url}/catalog`);
+    expect(catalog.status).toBe(200);
+    expect(catalog.headers.get('www-authenticate')).toBeNull();
+
+    const health = await (await fetch(`${h.url}/health`)).json();
+    expect(Object.keys(health).sort()).toEqual(['serverStatus', 'servers', 'status', 'tools']);
+  });
+
+  it('treats an empty allowedHosts list as unset', async () => {
+    const h = await start(['a'], () => true, { appOptions: { allowedHosts: [] } });
+    const res = await rawRequest(h, {
+      method: 'POST',
+      path: '/mcp',
+      headers: { host: 'anything.example' },
+      body: INITIALIZE,
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('createApp /mcp body errors', () => {
+  it('answers a JSON-RPC parse error to a malformed JSON body', async () => {
+    const h = await start();
+
+    const res = await fetch(`${h.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: '{"jsonrpc": "2.0", "method": ',
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toMatch(/^application\/json/);
+    expect(await res.json()).toEqual({
+      jsonrpc: '2.0',
+      error: { code: -32700, message: 'Parse error' },
+      id: null,
+    });
+    expect(h.gatewayApp.sessionCount()).toBe(0);
+  });
+
+  it('answers a JSON-RPC error to a body over the 4mb limit', async () => {
+    const h = await start();
+    const sessionId = await rawInitialize(h);
+
+    const res = await post(
+      h,
+      {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'a', arguments: { blob: 'x'.repeat(4 * 1024 * 1024 + 1024) } },
+      },
+      sessionId,
+    );
+    expect(res.status).toBe(413);
+    expect(res.headers.get('content-type')).toMatch(/^application\/json/);
+    const body = await res.json();
+    expect(body).toMatchObject({ jsonrpc: '2.0', error: { code: -32600 }, id: null });
+    expect(body.error.message).toMatch(/too large/i);
+
+    // The session is still usable afterwards.
+    const after = await post(h, LIST_TOOLS, sessionId);
+    expect(after.status).toBe(200);
+    await after.body?.cancel();
+  });
+});
+
+describe('parseAuthToken and parseAllowedHosts', () => {
+  it('trims the token and treats an empty one as unset', () => {
+    expect(parseAuthToken(undefined)).toBeUndefined();
+    expect(parseAuthToken('')).toBeUndefined();
+    expect(parseAuthToken('   ')).toBeUndefined();
+    expect(parseAuthToken('  s3cret\n')).toBe('s3cret');
+  });
+
+  it('splits hosts on commas, trims them and drops empty entries', () => {
+    expect(parseAllowedHosts(undefined)).toBeUndefined();
+    expect(parseAllowedHosts('')).toBeUndefined();
+    expect(parseAllowedHosts(' , ,')).toBeUndefined();
+    expect(parseAllowedHosts(' gateway.test:20001 , localhost:20001,,')).toEqual([
+      'gateway.test:20001',
+      'localhost:20001',
+    ]);
   });
 });

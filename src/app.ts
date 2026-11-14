@@ -1,5 +1,11 @@
-import { randomUUID } from 'crypto';
-import express, { type Express, type Request, type RequestHandler, type Response } from 'express';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
+import express, {
+  type ErrorRequestHandler,
+  type Express,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
@@ -14,6 +20,32 @@ const PROGRESS_HEARTBEAT_INTERVAL_MS = 5_000;
 export interface AppOptions {
   /** Interval of the progress heartbeat sent while a tool call is running. */
   heartbeatIntervalMs?: number;
+  /**
+   * Opt-in bearer token. When set, /mcp and /catalog require
+   * `Authorization: Bearer <token>` and /health is reduced for callers
+   * without it.
+   */
+  authToken?: string;
+  /**
+   * Opt-in Host allow-list (DNS rebinding protection) for /mcp. Entries are
+   * matched exactly against the Host header, port included.
+   */
+  allowedHosts?: string[];
+}
+
+/** GATEWAY_TOKEN: trimmed; an empty value means auth is disabled. */
+export function parseAuthToken(raw: string | undefined): string | undefined {
+  const token = raw?.trim();
+  return token ? token : undefined;
+}
+
+/** GATEWAY_ALLOWED_HOSTS: comma separated, trimmed, empty entries dropped. */
+export function parseAllowedHosts(raw: string | undefined): string[] | undefined {
+  const hosts = (raw ?? '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter((host) => host.length > 0);
+  return hosts.length > 0 ? hosts : undefined;
 }
 
 export interface GatewayApp {
@@ -26,6 +58,16 @@ export interface GatewayApp {
 
 function sendJsonRpcError(res: Response, status: number, code: number, message: string): void {
   res.status(status).json({ jsonrpc: '2.0', error: { code, message }, id: null });
+}
+
+function sha256(value: string): Buffer {
+  return createHash('sha256').update(value).digest();
+}
+
+/** Body-parser failures carry an HTTP status and a `type` discriminator. */
+interface BodyParserError {
+  status?: number;
+  type?: string;
 }
 
 function sessionIdOf(req: Request): string | undefined {
@@ -53,6 +95,11 @@ function guarded(handler: (req: Request, res: Response) => Promise<void>): Reque
 
 export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
   const heartbeatIntervalMs = opts.heartbeatIntervalMs ?? PROGRESS_HEARTBEAT_INTERVAL_MS;
+  // Digest of the expected token: comparing fixed-length digests in constant
+  // time leaks neither the token nor its length.
+  const authDigest = opts.authToken ? sha256(opts.authToken) : undefined;
+  const allowedHosts =
+    opts.allowedHosts && opts.allowedHosts.length > 0 ? opts.allowedHosts : undefined;
   const transports = new Map<string, StreamableHTTPServerTransport>();
   /** MCP Server of each live session, to push server-initiated notifications. */
   const servers = new Map<string, Server>();
@@ -105,7 +152,38 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
     return server;
   }
 
+  /** Whether the request carries the configured bearer token (true when auth is off). */
+  function isAuthorized(req: Request): boolean {
+    if (!authDigest) return true;
+    const match = /^Bearer +(.+)$/i.exec(req.headers.authorization ?? '');
+    if (!match) return false;
+    return timingSafeEqual(sha256(match[1]), authDigest);
+  }
+
+  const requireAuth: RequestHandler = (req, res, next) => {
+    if (isAuthorized(req)) {
+      next();
+      return;
+    }
+    res.set('WWW-Authenticate', 'Bearer');
+    sendJsonRpcError(res, 401, -32001, 'Unauthorized');
+  };
+
+  // The SDK transport validates the Host header too, but unknown-session and
+  // non-initialize requests are answered before a transport exists.
+  const requireAllowedHost: RequestHandler = (req, res, next) => {
+    const host = req.headers.host;
+    if (!allowedHosts || (host !== undefined && allowedHosts.includes(host))) {
+      next();
+      return;
+    }
+    sendJsonRpcError(res, 403, -32000, `Invalid Host header: ${host}`);
+  };
+
   const app = express();
+  // Both checks run before the body is parsed and before any session lookup:
+  // a caller that is not allowed in gets nothing else done on its behalf.
+  app.use('/mcp', requireAllowedHost, requireAuth);
   app.use(express.json({ limit: '4mb' }));
 
   app.post('/mcp', guarded(async (req, res) => {
@@ -131,6 +209,7 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
     const server = buildServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      ...(allowedHosts ? { enableDnsRebindingProtection: true, allowedHosts } : {}),
       onsessioninitialized: (id) => {
         transports.set(id, transport);
         servers.set(id, server);
@@ -164,24 +243,52 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
   app.get('/mcp', handleSessionRequest);
   app.delete('/mcp', handleSessionRequest);
 
-  app.get('/health', (_req, res) => {
+  app.get('/health', (req, res) => {
     const servers = gateway.serverStatuses;
     const failedServers = servers.filter((server) => server.enabled && !server.connected);
+    const status = failedServers.length === 0 ? 'ok' : 'degraded';
+    const tools = gateway.listTools().length;
+
+    // /health stays open for probes, but with auth enabled an unauthenticated
+    // caller must not learn server names, targets or error strings.
+    if (!isAuthorized(req)) {
+      res.json({ status, tools });
+      return;
+    }
 
     res.json({
-      status: failedServers.length === 0 ? 'ok' : 'degraded',
+      status,
       servers: gateway.connectedServers,
       serverStatus: servers,
-      tools: gateway.listTools().length,
+      tools,
     });
   });
 
-  app.get('/catalog', (_req, res) => {
+  app.get('/catalog', requireAuth, (_req, res) => {
     res.json({
       servers: gateway.serverStatuses,
       tools: gateway.catalog,
     });
   });
+
+  // Body-parser failures on /mcp (malformed JSON, body over the limit) are
+  // answered as JSON-RPC errors instead of Express's default HTML page.
+  const handleBodyError: ErrorRequestHandler = (error: BodyParserError, req, res, next) => {
+    if (res.headersSent || req.path !== '/mcp') {
+      next(error);
+      return;
+    }
+    if (error.type === 'entity.parse.failed') {
+      sendJsonRpcError(res, 400, -32700, 'Parse error');
+    } else if (error.type === 'entity.too.large') {
+      sendJsonRpcError(res, 413, -32600, 'Invalid Request: request body too large (limit 4mb)');
+    } else if (error.status !== undefined && error.status >= 400 && error.status < 500) {
+      sendJsonRpcError(res, error.status, -32600, 'Invalid Request');
+    } else {
+      next(error);
+    }
+  };
+  app.use(handleBodyError);
 
   return {
     app,

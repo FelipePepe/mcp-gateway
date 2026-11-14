@@ -1,6 +1,6 @@
 import { Gateway } from './gateway.js';
 import { loadConfig } from './config.js';
-import { createApp } from './app.js';
+import { createApp, parseAllowedHosts, parseAuthToken } from './app.js';
 
 const DEFAULT_PORT = 3001;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
@@ -20,7 +20,19 @@ const PORT = resolvePort(process.env.PORT);
 async function main() {
   const config = loadConfig();
   const gateway = new Gateway();
-  const { app, closeSessions } = createApp(gateway);
+  // Both are opt-in: unset means the endpoint behaves as it always did.
+  const authToken = parseAuthToken(process.env.GATEWAY_TOKEN);
+  const allowedHosts = parseAllowedHosts(process.env.GATEWAY_ALLOWED_HOSTS);
+  const { app, closeSessions } = createApp(gateway, { authToken, allowedHosts });
+  // Never log the token itself.
+  console.error(
+    authToken
+      ? '[gateway] Auth: enabled (bearer token required on /mcp and /catalog)'
+      : '[gateway] Auth: disabled (GATEWAY_TOKEN not set)',
+  );
+  if (allowedHosts) {
+    console.error(`[gateway] Allowed hosts on /mcp: ${allowedHosts.join(', ')}`);
+  }
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.error(`[gateway] Listening on http://0.0.0.0:${PORT}/mcp`);
