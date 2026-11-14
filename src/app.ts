@@ -92,7 +92,11 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
       }
 
       try {
-        return await gateway.callTool(name, (args ?? {}) as Record<string, unknown>);
+        // extra.signal aborts when the client cancels the request (or the
+        // session closes); the gateway forwards it to the upstream call.
+        return await gateway.callTool(name, (args ?? {}) as Record<string, unknown>, {
+          signal: extra.signal,
+        });
       } finally {
         if (heartbeat) clearInterval(heartbeat);
       }

@@ -8,7 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createApp, type GatewayApp } from './app.js';
+import { createApp, type AppOptions, type GatewayApp } from './app.js';
 import { Gateway } from './gateway.js';
 import type { ServerConfig } from './config.js';
 
@@ -62,13 +62,20 @@ interface Harness {
 
 let harness: Harness | undefined;
 
+interface StartOptions {
+  /** Upstream transport factory; defaults to `makeFactory(tools, isUp)`. */
+  factory?: (server: ServerConfig) => Transport;
+  appOptions?: AppOptions;
+}
+
 async function start(
   tools: string[] = ['a', 'b'],
   isUp: () => boolean = () => true,
+  options: StartOptions = {},
 ): Promise<Harness> {
-  const gateway = new Gateway(makeFactory(tools, isUp));
+  const gateway = new Gateway(options.factory ?? makeFactory(tools, isUp));
   await gateway.connect([fake], FAST);
-  const gatewayApp = createApp(gateway);
+  const gatewayApp = createApp(gateway, options.appOptions);
   const httpServer = await new Promise<HttpServer>((resolve) => {
     const s = gatewayApp.app.listen(0, '127.0.0.1', () => resolve(s));
   });
@@ -241,6 +248,57 @@ describe('createApp /mcp', () => {
     });
     expect(result.isError).toBeFalsy();
     expect(result.content).toEqual([{ type: 'text', text: 'ok:a' }]);
+  });
+});
+
+describe('createApp tool call cancellation', () => {
+  it('forwards a client cancellation to the upstream tool call', async () => {
+    let started!: () => void;
+    const upstreamStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let cancelled!: () => void;
+    const upstreamCancelled = new Promise<void>((resolve) => {
+      cancelled = resolve;
+    });
+    const h = await start([], () => true, {
+      factory: () => {
+        const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+        const server = new McpServer({ name: 'slow', version: '0.0.0' });
+        server.registerTool('slow', { description: 'never answers' }, async (extra) => {
+          started();
+          await new Promise<void>((resolve) => {
+            extra.signal.addEventListener('abort', () => resolve());
+          });
+          cancelled();
+          return { content: [{ type: 'text' as const, text: 'late' }] };
+        });
+        void server.connect(serverSide);
+        return clientSide;
+      },
+    });
+    const client = await connectClient(h);
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const controller = new AbortController();
+    const call = client.callTool({ name: 'slow', arguments: {} }, undefined, {
+      signal: controller.signal,
+    });
+    const outcome = call.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await upstreamStarted;
+    controller.abort(new Error('user cancelled'));
+
+    // The cancellation travels client -> gateway -> upstream handler.
+    await upstreamCancelled;
+    expect(await outcome).toBe('rejected');
+
+    // A cancelled call is not an error worth logging, and the session survives.
+    expect(errorLog.mock.calls).toEqual([]);
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).toEqual(['slow']);
   });
 });
 
