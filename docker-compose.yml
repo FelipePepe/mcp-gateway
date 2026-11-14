@@ -6,6 +6,9 @@ services:
     image: mcp-gateway:latest
     container_name: mcp-gateway
     restart: always
+    # tini as PID 1 forwards SIGTERM so the gateway can shut down cleanly.
+    init: true
+    stop_grace_period: 15s
     ports:
       - "20001:20001"
     extra_hosts:

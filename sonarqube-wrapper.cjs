@@ -22,9 +22,11 @@ if (!SONARQUBE_URL || !SONARQUBE_TOKEN) {
 const proc = spawn("docker", [
   "run", "-i", "--rm", "--network", "host",
   "-v", "sonarqube-mcp-storage:/root/.sonarlint",
-  "-e", "SONARQUBE_TOKEN=" + SONARQUBE_TOKEN,
-  "-e", "SONARQUBE_URL=" + SONARQUBE_URL,
+  // Name only: docker reads the values from this process's environment, so
+  // the token never shows up in argv (`ps`, `docker inspect` of the caller).
+  "-e", "SONARQUBE_TOKEN",
+  "-e", "SONARQUBE_URL",
   "mcp/sonarqube"
-], { stdio: "inherit", env: process.env });
+], { stdio: "inherit", env: { ...process.env, SONARQUBE_TOKEN, SONARQUBE_URL } });
 
 proc.on("exit", function(code) { process.exit(code != null ? code : 0); });

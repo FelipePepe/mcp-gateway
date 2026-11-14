@@ -1,0 +1,211 @@
+{
+  "feature": "gateway-hardening",
+  "objective": "Harden the MCP gateway: correct HTTP session handling, tool list change notifications, upstream liveness for HTTP upstreams, deterministic routing, config validation, opt-in auth and repo cleanup.",
+  "problem": "Audit on 2026-11-14 found: unknown session ids answered 400 instead of 404 and leaked transports (A1); sessions never cleaned (A2); no tools/list_changed (A3); HTTP upstreams never detected as down (A4); no auth on 0.0.0.0 with docker socket and engram mounted (A5); unhandled async handler errors (M1); no graceful shutdown (M2); non-deterministic tool name collisions (M3); 100kB body limit (M4); cancellation not propagated (M5); weak config validation (M6); listTools pagination ignored (M7); lefthook references a missing .gitleaks.toml (M8).",
+  "scope": {
+    "in": [
+      "src/app.ts",
+      "src/app.test.ts",
+      "src/server.ts",
+      "src/gateway.ts",
+      "src/gateway.test.ts",
+      "src/config.ts",
+      "src/config.test.ts",
+      "sonarqube-wrapper.cjs",
+      "lefthook.yml",
+      "docker-compose.yml",
+      "../docker-compose.yml",
+      "AGENTS.md",
+      "src/servers.json (delete)",
+      "src/docker-compose.yml (delete)"
+    ],
+    "out": [
+      "codebase-memory daemon failing to start in the container (A6)",
+      "proxying upstream resources and prompts",
+      "container rebuild or redeploy",
+      "push and pull request",
+      "uncommitted user changes in servers.json and servers.json.bak-atlas-rag"
+    ]
+  },
+  "constraints": [
+    "Branch feature/gateway-hardening from develop (develop created from main on 2026-11-14)",
+    "Conventional commits, no AI attribution",
+    "Never build after changes; no container rebuild",
+    "Auth is opt-in: no GATEWAY_TOKEN means unchanged behavior",
+    "About 400 changed lines per task is a planning heuristic only"
+  ],
+  "tdd": {
+    "mode": "on",
+    "source": "plan approved by the user on 2026-11-14 (same as previous feature in this repo)",
+    "runner": "pnpm test (Vitest 3.x) + pnpm typecheck"
+  },
+  "route": "delegated direct: one writer per task touching 2+ non-trivial files (writer trigger); T5 and T7 inline (small, mechanical)",
+  "tasks": [
+    {
+      "id": "T1",
+      "step": 1,
+      "mode": "standard",
+      "status": "done",
+      "description": "HTTP sessions. Extract the Express app to src/app.ts (createApp(gateway, opts)); src/server.ts keeps bootstrap only. 404 JSON-RPC for unknown mcp-session-id; new transport only on initialize; transport.onclose removes the session; DELETE delegates to transport.handleRequest; try/catch in handlers with 500 JSON-RPC; express.json limit 4mb. server.ts: validate PORT, exit(1) on fatal error, graceful SIGTERM/SIGINT. Tests in src/app.test.ts over real HTTP.",
+      "tool": "Agent (delegated writer)",
+      "args": {
+        "query": "src/app.ts, src/app.test.ts, src/server.ts"
+      },
+      "reason": "Fixes A1, A2, M1, M4, part of M2; makes the HTTP layer testable.",
+      "evidence": "RED 7/9 failing, GREEN 21/21; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "b3d7a80",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T2",
+      "step": 2,
+      "mode": "standard",
+      "status": "done",
+      "description": "tools/list_changed. gateway.ts: onToolsChanged callback fired when an upstream registers or drops tools. app.ts: declare capabilities.tools.listChanged and broadcast sendToolListChanged() to all live sessions. Tests in gateway.test.ts and app.test.ts.",
+      "tool": "Agent (delegated writer)",
+      "args": {
+        "query": "src/gateway.ts, src/app.ts, src/gateway.test.ts, src/app.test.ts"
+      },
+      "reason": "Fixes A3.",
+      "evidence": "RED 6 failing, GREEN 27/27; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "9ac8bbf",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T3",
+      "step": 3,
+      "mode": "standard",
+      "status": "done",
+      "description": "Upstream liveness and close. gateway.ts: periodic ping per connected upstream (pingIntervalMs, default 30s); on failure close the client so handleDisconnect reconnects. Gateway.close() stops loops and pings and closes all clients; server.ts calls it on shutdown. config.ts: pingIntervalMs field. Tests with an in-memory transport that stops answering.",
+      "tool": "Agent (delegated writer)",
+      "args": {
+        "query": "src/gateway.ts, src/config.ts, src/server.ts, src/gateway.test.ts, src/config.test.ts"
+      },
+      "reason": "Fixes A4 and completes M2.",
+      "evidence": "RED 8 failing, GREEN 35/35; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "7d51e17",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T4",
+      "step": 4,
+      "mode": "standard",
+      "status": "done",
+      "description": "Robust routing. gateway.ts: deterministic collisions (first registered wins; skipped tools reported in status as skippedTools), listTools pagination via nextCursor, forward the cancellation signal to client.callTool (app.ts passes extra.signal), single ServerStatus builder, backoff jitter, retry log only on powers of two. Tests for each.",
+      "tool": "Agent (delegated writer)",
+      "args": {
+        "query": "src/gateway.ts, src/app.ts, src/gateway.test.ts"
+      },
+      "reason": "Fixes M3, M5, M7 and cuts retry log noise.",
+      "evidence": "RED 10/46 failing, GREEN 46/46; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "f13627d",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T5",
+      "step": 5,
+      "mode": "standard",
+      "status": "done",
+      "description": "Config validation. config.ts: reject duplicate server names and container on non-stdio types; warn on duplicate prefixes. Tests in config.test.ts.",
+      "tool": "Edit (inline)",
+      "args": {
+        "query": "src/config.ts, src/config.test.ts"
+      },
+      "reason": "Fixes M6.",
+      "evidence": "RED 5/14 failing, GREEN 53/53; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "b7d13ff",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T6",
+      "step": 6,
+      "mode": "standard",
+      "status": "done",
+      "description": "Opt-in security. app.ts: when GATEWAY_TOKEN is set require Authorization: Bearer on /mcp and /catalog with constant-time compare (/health stays open); when GATEWAY_ALLOWED_HOSTS is set enable the SDK DNS rebinding protection. sonarqube-wrapper.cjs: pass the token through the environment instead of argv. Tests for 401 and for the no-token path.",
+      "tool": "Agent (delegated writer)",
+      "args": {
+        "query": "src/app.ts, src/server.ts, src/app.test.ts, sonarqube-wrapper.cjs"
+      },
+      "reason": "Mitigates A5 without breaking current clients.",
+      "evidence": "RED 18/75 failing, GREEN 75/75; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "750e29c",
+      "review": "unavailable (gentle-ai not installed)"
+    },
+    {
+      "id": "T7",
+      "step": 7,
+      "mode": "standard",
+      "status": "done",
+      "description": "Cleanup and docs. Delete src/servers.json and src/docker-compose.yml. lefthook.yml: drop --config .gitleaks.toml. docker-compose.yml and ../docker-compose.yml: init: true and stop_grace_period for mcp-gateway (no redeploy). Read version from package.json in gateway.ts and app.ts. AGENTS.md: document app.ts, new env vars, ping, list_changed.",
+      "tool": "Edit + Bash (git rm)",
+      "args": {
+        "query": "src/servers.json, src/docker-compose.yml, lefthook.yml, docker-compose.yml, ../docker-compose.yml, AGENTS.md, src/gateway.ts, src/app.ts"
+      },
+      "reason": "Fixes M8 and low findings.",
+      "evidence": "version test RED then GREEN 79/79; compose files validated with docker compose config; wrapper syntax checked only; RED/GREEN as reported by the delegated writer, final suite re-run by the parent",
+      "commit": "302dff7, a6f229b, 6243155",
+      "review": "unavailable (gentle-ai not installed)"
+    }
+  ],
+  "acceptance": [
+    "POST /mcp with an unknown session id returns 404; DELETE and transport close release the session",
+    "A connected client receives notifications/tools/list_changed when an upstream registers or drops tools",
+    "An upstream that stops answering pings is marked disconnected and reconnects",
+    "Name collisions resolve to the first registered tool and are visible in status",
+    "With GATEWAY_TOKEN set, /mcp and /catalog return 401 without the bearer token; without it behavior is unchanged",
+    "pnpm test and pnpm typecheck pass; the 12 baseline tests still pass"
+  ],
+  "delivery": {
+    "strategy": "ask-on-risk",
+    "forecast_lines": 800,
+    "slices": [
+      {
+        "name": "slice-1 runtime",
+        "tasks": [
+          "T1",
+          "T2",
+          "T3"
+        ],
+        "commits": [
+          "b3d7a80",
+          "9ac8bbf",
+          "7d51e17"
+        ]
+      },
+      {
+        "name": "slice-2 routing, config, security, cleanup",
+        "tasks": [
+          "T4",
+          "T5",
+          "T6",
+          "T7"
+        ],
+        "commits": [
+          "f13627d",
+          "b7d13ff",
+          "750e29c",
+          "302dff7",
+          "a6f229b",
+          "6243155"
+        ]
+      }
+    ],
+    "note": "Two slices approved in the plan. No push or PR until the user asks.",
+    "running_lines": "about 2270 added, 230 removed (mostly tests)"
+  },
+  "progress": "All 7 tasks done on feature/gateway-hardening (9 commits on top of d3624e1). Not built, not deployed, not pushed.",
+  "evidence": [
+    "2026-11-14 parent run: vitest 79 passed in 4 files; tsc --noEmit exit 0; deployed servers.json parses (8 servers)",
+    "../docker-compose.yml (outside this repo) edited with init: true and stop_grace_period, uncommitted"
+  ],
+  "next_step": "User decides: rebuild and redeploy mcp-gateway, push develop and feature branch, open PR to develop.",
+  "pending": [
+    "connectServer still logs failed to connect on every attempt (only the reconnect line is throttled)",
+    "same-server rename collisions still last-wins",
+    "server.ts bootstrap (PORT, signals) has no tests",
+    "test files are excluded from tsc",
+    "SDK-level DNS rebinding option not exercised by tests",
+    "A6 codebase-memory daemon does not start in the container",
+    "git hooks are not installed in this clone (lefthook not on PATH)"
+  ]
+}
