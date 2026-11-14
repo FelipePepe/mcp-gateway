@@ -31,17 +31,66 @@ const ServerConfigSchema = z.object({
       message: `${server.type} servers require a cmd`,
     });
   }
+
+  // Only stdio servers are run through `docker exec` in a container; on any
+  // other type the field would be silently ignored.
+  if (server.type !== 'stdio' && server.container !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['container'],
+      message: `container is only valid for stdio servers (type is ${server.type})`,
+    });
+  }
 });
 
 const GatewayConfigSchema = z.object({
   servers: z.array(ServerConfigSchema),
+}).superRefine((config, ctx) => {
+  // The name identifies a server in routing, status and logs: it must be
+  // unique even across disabled servers.
+  const firstIndex = new Map<string, number>();
+  config.servers.forEach((server, index) => {
+    const first = firstIndex.get(server.name);
+    if (first === undefined) {
+      firstIndex.set(server.name, index);
+      return;
+    }
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['servers', index, 'name'],
+      message: `duplicate server name "${server.name}" (already used by servers[${first}])`,
+    });
+  });
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 export type GatewayConfig = z.infer<typeof GatewayConfigSchema>;
 
+/**
+ * Enabled servers may share a prefix on purpose, but their tool names can
+ * then collide (the gateway keeps the first configured one): warn once per
+ * shared prefix.
+ */
+function warnDuplicatePrefixes(config: GatewayConfig): void {
+  const byPrefix = new Map<string, string[]>();
+  for (const server of config.servers) {
+    if (!server.enabled || server.prefix === undefined) continue;
+    const names = byPrefix.get(server.prefix) ?? [];
+    names.push(server.name);
+    byPrefix.set(server.prefix, names);
+  }
+  for (const [prefix, names] of byPrefix) {
+    if (names.length < 2) continue;
+    console.error(
+      `[gateway] prefix "${prefix}" is shared by servers ${names.join(', ')}; their tool names may collide`,
+    );
+  }
+}
+
 export function parseConfig(raw: unknown): GatewayConfig {
-  return GatewayConfigSchema.parse(raw);
+  const config = GatewayConfigSchema.parse(raw);
+  warnDuplicatePrefixes(config);
+  return config;
 }
 
 export function loadConfig(path = 'servers.json'): GatewayConfig {
