@@ -14,6 +14,7 @@ import {
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Gateway } from './gateway.js';
+import { VERSION } from './version.js';
 
 const PROGRESS_HEARTBEAT_INTERVAL_MS = 5_000;
 
@@ -114,7 +115,7 @@ export function createApp(gateway: Gateway, opts: AppOptions = {}): GatewayApp {
 
   function buildServer(): Server {
     const server = new Server(
-      { name: 'mcp-gateway', version: '0.1.0' },
+      { name: 'mcp-gateway', version: VERSION },
       { capabilities: { tools: { listChanged: true } } }
     );
 

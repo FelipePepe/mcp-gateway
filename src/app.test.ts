@@ -18,6 +18,9 @@ import {
 import { Gateway } from './gateway.js';
 import type { ServerConfig } from './config.js';
 
+// A version no literal in the sources can match: proves it comes from version.ts.
+vi.mock('./version.js', () => ({ VERSION: '9.9.9-test' }));
+
 const fake: ServerConfig = { name: 'fake', type: 'http', url: 'http://unused', enabled: true };
 const FAST = { baseMs: 5, capMs: 10 };
 const MCP_HEADERS = {
@@ -193,6 +196,15 @@ describe('createApp /mcp', () => {
     expect(result.isError).toBeFalsy();
     expect(result.content).toEqual([{ type: 'text', text: 'ok:a' }]);
     expect(h.gatewayApp.sessionCount()).toBe(1);
+  });
+
+  it('announces the version of version.ts in its server info', async () => {
+    const h = await start();
+    const client = await connectClient(h);
+    expect(client.getServerVersion()).toMatchObject({
+      name: 'mcp-gateway',
+      version: '9.9.9-test',
+    });
   });
 
   it('answers 404 to a POST with an unknown session id and creates no session', async () => {

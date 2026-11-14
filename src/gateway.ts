@@ -6,6 +6,7 @@ import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.j
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ServerConfig } from './config.js';
+import { VERSION } from './version.js';
 
 /** One connect attempt; `cancelled` is set when it times out. */
 interface Attempt {
@@ -499,7 +500,7 @@ export class Gateway {
     try {
       const transport = this.transportFactory(server);
 
-      client = new Client({ name: 'mcp-gateway', version: '0.1.0' }, { capabilities: {} });
+      client = new Client({ name: 'mcp-gateway', version: VERSION }, { capabilities: {} });
       attempt.client = client;
 
       // Register the client only once connect AND listTools both succeeded,

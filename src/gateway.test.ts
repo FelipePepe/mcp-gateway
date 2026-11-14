@@ -7,6 +7,9 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { connectWithRetry, Gateway, MAX_TOOL_LIST_PAGES } from './gateway.js';
 import type { ServerConfig } from './config.js';
 
+// A version no literal in the sources can match: proves it comes from version.ts.
+vi.mock('./version.js', () => ({ VERSION: '9.9.9-test' }));
+
 interface AttemptPlan {
   /** Tool names to register; `null` leaves tools/list unhandled (it errors). */
   tools: string[] | null;
@@ -237,6 +240,18 @@ describe('Gateway upstream lifecycle', () => {
     expect(gw.listTools().map((t) => t.name).sort()).toEqual(['a', 'b']);
     expect(gw.connectedServers).toEqual(['fake']);
     expect(gw.serverStatuses[0]).toMatchObject({ connected: true, tools: 2 });
+  });
+
+  it('announces the version of version.ts to its upstreams', async () => {
+    const up = makeUpstream(() => ({ tools: ['a'] }));
+    const gw = new Gateway(up.factory);
+    await gw.connect([fake], FAST);
+    gw.stop();
+
+    expect(up.servers[0].server.getClientVersion()).toEqual({
+      name: 'mcp-gateway',
+      version: '9.9.9-test',
+    });
   });
 
   it('does not report success when listTools fails, and keeps retrying', async () => {
