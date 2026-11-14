@@ -52,8 +52,11 @@ async function main() {
       .catch((error: unknown) => {
         console.error(`[gateway] Failed to close sessions: ${(error as Error).message}`);
       })
+      .then(() => gateway.close())
+      .catch((error: unknown) => {
+        console.error(`[gateway] Failed to close upstreams: ${(error as Error).message}`);
+      })
       .then(() => {
-        gateway.stop();
         process.exit(0);
       });
   };

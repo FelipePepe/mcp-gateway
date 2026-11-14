@@ -43,6 +43,8 @@ export interface RetryOptions {
 
 export const RETRY_BASE_MS = 2_000;
 export const RETRY_CAP_MS = 30_000;
+export const DEFAULT_PING_INTERVAL_MS = 30_000;
+export const MAX_PING_TIMEOUT_MS = 10_000;
 
 type SleepFn = (ms: number) => Promise<void>;
 
@@ -112,6 +114,10 @@ export class Gateway {
   /** Servers with a reconnect loop in flight (dedupes boot and onclose paths). */
   private reconnecting = new Set<string>();
   private toolsChangedListeners = new Set<() => void>();
+  /** Liveness ping timer of each registered client. */
+  private pingTimers = new Map<string, NodeJS.Timeout>();
+  /** Set by close(): in-flight connect attempts must not register anymore. */
+  private closed = false;
 
   constructor(
     private readonly transportFactory: (server: ServerConfig) => Transport = buildTransport,
@@ -144,7 +150,72 @@ export class Gateway {
     this.stopped = true;
   }
 
+  /**
+   * Shut the gateway down: halt reconnect loops and pings and close every
+   * upstream client. Nothing reconnects afterwards.
+   */
+  async close(): Promise<void> {
+    this.stopped = true;
+    this.closed = true;
+    this.clearPingTimers();
+
+    // Release the clients first so their onclose is ignored by
+    // handleDisconnect (no "upstream closed" bookkeeping, no reconnect).
+    const clients = Array.from(this.clients.values());
+    this.clients.clear();
+    const hadTools = this.toolMap.size > 0;
+    this.toolMap.clear();
+    for (const [name, status] of this.statuses) {
+      this.statuses.set(name, { ...status, connected: false, tools: 0 });
+    }
+    if (hadTools) this.notifyToolsChanged();
+
+    await Promise.all(clients.map((client) => client.close().catch(() => undefined)));
+  }
+
+  private clearPingTimers(): void {
+    for (const timer of this.pingTimers.values()) clearInterval(timer);
+    this.pingTimers.clear();
+  }
+
+  private stopPing(serverName: string): void {
+    clearInterval(this.pingTimers.get(serverName));
+    this.pingTimers.delete(serverName);
+  }
+
+  /**
+   * Ping a registered client periodically. HTTP client transports only fire
+   * onclose on a local close, so an upstream that restarted would otherwise
+   * stay "connected" forever; a failed ping is treated as a disconnect.
+   */
+  private startPing(server: ServerConfig, client: Client): void {
+    this.stopPing(server.name);
+    const intervalMs = server.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    const timeout = Math.min(intervalMs, MAX_PING_TIMEOUT_MS);
+    let inFlight = false;
+    const timer = setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
+      client.ping({ timeout }).then(
+        () => {
+          inFlight = false;
+        },
+        (error: unknown) => {
+          inFlight = false;
+          // Ignore pings of clients that were already replaced or released.
+          if (this.clients.get(server.name) !== client) return;
+          const message = error instanceof Error ? error.message : String(error);
+          this.handleDisconnect(server, client, `ping failed: ${message}`);
+          void client.close().catch(() => undefined);
+        },
+      );
+    }, intervalMs);
+    timer.unref();
+    this.pingTimers.set(server.name, timer);
+  }
+
   async connect(servers: ServerConfig[], retry?: RetryOptions): Promise<void> {
+    this.clearPingTimers();
     this.clients.clear();
     this.toolMap.clear();
     this.timeouts.clear();
@@ -200,9 +271,10 @@ export class Gateway {
     return dropped;
   }
 
-  private handleDisconnect(server: ServerConfig, client: Client): void {
+  private handleDisconnect(server: ServerConfig, client: Client, reason = 'upstream closed'): void {
     // Ignore closes from clients that were already replaced or released.
     if (this.clients.get(server.name) !== client) return;
+    this.stopPing(server.name);
     this.clients.delete(server.name);
     const dropped = this.dropTools(server.name);
     this.statuses.set(server.name, {
@@ -212,9 +284,9 @@ export class Gateway {
       enabled: true,
       connected: false,
       tools: 0,
-      error: 'upstream closed',
+      error: reason,
     });
-    console.error(`[gateway] ${server.name} — upstream closed; reconnecting`);
+    console.error(`[gateway] ${server.name} — ${reason}; reconnecting`);
     if (dropped) this.notifyToolsChanged();
     this.scheduleReconnect(server);
   }
@@ -269,11 +341,17 @@ export class Gateway {
         // Timed out while in flight (the timer already closed the client).
         return false;
       }
+      if (this.closed) {
+        // close() ran while this attempt was in flight: release it.
+        await client.close().catch(() => undefined);
+        return false;
+      }
 
       const dropped = this.dropTools(server.name);
       this.clients.set(server.name, client);
       const live = client;
       live.onclose = () => this.handleDisconnect(server, live);
+      this.startPing(server, live);
       if (server.timeoutMs) this.timeouts.set(server.name, server.timeoutMs);
 
       for (const tool of tools) {

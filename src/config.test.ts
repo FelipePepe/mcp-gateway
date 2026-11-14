@@ -36,4 +36,24 @@ describe('parseConfig', () => {
       }),
     ).toThrow(/cmd/);
   });
+
+  it('accepts a positive pingIntervalMs and leaves it unset by default', () => {
+    const config = parseConfig({
+      servers: [
+        { name: 'search', type: 'http', url: 'http://search:8080/mcp', pingIntervalMs: 5000 },
+        { name: 'plain', type: 'http', url: 'http://plain:8080/mcp' },
+      ],
+    });
+
+    expect(config.servers[0].pingIntervalMs).toBe(5000);
+    expect(config.servers[1].pingIntervalMs).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5])('rejects pingIntervalMs %s', (pingIntervalMs) => {
+    expect(() =>
+      parseConfig({
+        servers: [{ name: 'search', type: 'http', url: 'http://search:8080/mcp', pingIntervalMs }],
+      }),
+    ).toThrow(/pingIntervalMs/);
+  });
 });

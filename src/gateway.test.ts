@@ -318,3 +318,110 @@ describe('Gateway tool list change notifications', () => {
     expect(healthy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('Gateway upstream liveness', () => {
+  /** Count the pings the gateway sends through a client-side transport. */
+  function countPings(transport: Transport): () => number {
+    let pings = 0;
+    const realSend = transport.send.bind(transport);
+    transport.send = async (message, options) => {
+      if ('method' in message && message.method === 'ping') pings++;
+      await realSend(message, options);
+    };
+    return () => pings;
+  }
+
+  it('pings a healthy upstream periodically and keeps it connected', async () => {
+    const up = makeUpstream(() => ({ tools: ['a'] }));
+    const gw = new Gateway(up.factory);
+    await gw.connect([{ ...fake, pingIntervalMs: 10 }], FAST);
+    const pings = countPings(up.transports[0]);
+
+    await vi.waitFor(() => expect(pings()).toBeGreaterThanOrEqual(3));
+    expect(gw.serverStatuses[0]).toMatchObject({ connected: true, tools: 1 });
+    expect(up.transports.length).toBe(1);
+
+    // close() clears the ping timer: no ping may be sent afterwards.
+    await gw.close();
+    const afterClose = pings();
+    await new Promise((r) => setTimeout(r, 60));
+    expect(pings()).toBe(afterClose);
+  });
+
+  it('detects an upstream that stops answering pings, drops its tools and reconnects', async () => {
+    // Attempt 2 answers slowly so the disconnected state is observable.
+    const up = makeUpstream((n) => (n === 1 ? { tools: ['a', 'b'] } : { tools: ['a', 'b'], delayMs: 150 }));
+    const gw = new Gateway(up.factory);
+    await gw.connect([{ ...fake, pingIntervalMs: 20 }], FAST);
+    expect(gw.serverStatuses[0]).toMatchObject({ connected: true, tools: 2 });
+
+    // The upstream goes silent: messages are lost but nothing closes the
+    // connection, which is what a restarted HTTP upstream looks like.
+    up.transports[0].send = async () => undefined;
+
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(false));
+    expect(gw.serverStatuses[0].error).toMatch(/^ping failed: /);
+    expect(gw.connectedServers).toEqual([]);
+    expect(gw.listTools()).toEqual([]);
+    // The dead client is closed so it cannot leak.
+    await vi.waitFor(() => expect(up.closeSpies[0]).toHaveBeenCalled());
+
+    await vi.waitFor(() => expect(gw.serverStatuses[0].connected).toBe(true));
+    expect(gw.listTools().map((t) => t.name).sort()).toEqual(['a', 'b']);
+    expect(gw.connectedServers).toEqual(['fake']);
+    const result = await gw.callTool('a', {});
+    expect(result.isError).toBeFalsy();
+
+    // Exactly one reconnect loop ran, and the new client answers its pings.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(up.transports.length).toBe(2);
+    expect(gw.serverStatuses[0].connected).toBe(true);
+    expect(up.closeSpies[1]).not.toHaveBeenCalled();
+    await gw.close();
+  });
+
+  it('close() closes every upstream client and never reconnects', async () => {
+    const up = makeUpstream(() => ({ tools: ['a'] }));
+    const gw = new Gateway(up.factory);
+    const listener = vi.fn();
+    await gw.connect(
+      [
+        { ...fake, pingIntervalMs: 20 },
+        { ...fake, name: 'other', prefix: 'other', pingIntervalMs: 20 },
+      ],
+      FAST,
+    );
+    expect(gw.connectedServers.sort()).toEqual(['fake', 'other']);
+    gw.onToolsChanged(listener);
+
+    await gw.close();
+
+    expect(up.closeSpies[0]).toHaveBeenCalled();
+    expect(up.closeSpies[1]).toHaveBeenCalled();
+    expect(gw.connectedServers).toEqual([]);
+    expect(gw.listTools()).toEqual([]);
+    for (const status of gw.serverStatuses) {
+      expect(status).toMatchObject({ connected: false, tools: 0 });
+    }
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(up.transports.length).toBe(2);
+    expect(gw.connectedServers).toEqual([]);
+  });
+
+  it('close() halts the reconnect loop of an upstream that is still down', async () => {
+    const up = makeUpstream(() => ({ tools: null }));
+    const gw = new Gateway(up.factory);
+    await gw.connect([fake], FAST);
+    await vi.waitFor(() => expect(up.transports.length).toBeGreaterThanOrEqual(2));
+
+    await gw.close();
+    // Let an in-flight attempt finish, then the count must stay put.
+    await new Promise((r) => setTimeout(r, 50));
+    const attempts = up.transports.length;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(up.transports.length).toBe(attempts);
+    expect(gw.connectedServers).toEqual([]);
+  });
+});

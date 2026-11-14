@@ -13,6 +13,8 @@ const ServerConfigSchema = z.object({
   enabled: z.boolean().default(true),
   timeoutMs: z.number().int().positive().optional(),
   connectTimeoutMs: z.number().int().positive().optional(),
+  /** Liveness ping interval; the gateway defaults to 30000 when absent. */
+  pingIntervalMs: z.number().int().positive().optional(),
 }).superRefine((server, ctx) => {
   if ((server.type === 'http' || server.type === 'sse') && !server.url) {
     ctx.addIssue({
